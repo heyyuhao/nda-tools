@@ -1,5 +1,11 @@
 import argparse
 import sys
+from pathlib import Path
+NDA_ROOT = Path(
+    "/Users/yuhaohe/Documents/RA/healthcare_AI_RA/ConceptBottleneck/submodule/nda-tools"
+)
+if str(NDA_ROOT) not in sys.path:
+    sys.path.insert(0, str(NDA_ROOT))
 
 from NDATools import exit_error
 from NDATools.Configuration import *

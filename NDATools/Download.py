@@ -13,17 +13,153 @@ import uuid
 from queue import Queue
 from shutil import copyfile
 from threading import Thread
-
+from argparse import Namespace
 import pandas as pd
 from boto3.s3.transfer import TransferConfig
 from requests import HTTPError
 from tqdm import tqdm
+import sys
+from pathlib import Path
 
 import NDATools
 from NDATools.AltEndpointSSLAdapter import AltEndpointSSLAdapter
 from NDATools.Utils import *
 
+from dotenv import load_dotenv
+load_dotenv()
+
 logger = logging.getLogger(__name__)
+
+def filter_first_file_per_subject(df, target_path, local_root_dir=None):
+    """
+    Filters the metadata DataFrame to include only files under `target_path` matching:
+      - For each subject folder (numeric, e.g. 9000099) under target_path
+      - For each date folder under that subject
+      - If any `$number$_1x1.jpg` exists in that date folder:
+          collect that jpg AND the corresponding `$number$.tar.gz` file
+      - If no `_1x1.jpg` exists in a date folder, skip it entirely
+      - If local_root_dir is provided, skip files that already exist locally
+
+    Args:
+        df (pd.DataFrame): metadata with 'download_alias' column
+        target_path (str): e.g., "image03/12m/1.E.1"
+        local_root_dir (str, optional): local root directory where files are saved,
+                                        e.g. "/home/download_data/1243742"
+                                        Full local path = local_root_dir / download_alias
+
+    Returns:
+        pd.DataFrame: filtered DataFrame (excluding already-downloaded files)
+    """
+    import os
+    import pandas as pd
+
+    # Step 1: Keep only files under target_path
+    df_target = df[df['download_alias'].str.startswith(target_path)].copy()
+    if df_target.empty:
+        print(f"[Step 1] No files found under '{target_path}' in metadata.")
+        return df_target
+    print(f"[Step 1] Found {len(df_target):,} metadata rows under '{target_path}'.")
+
+    # Step 2: Parse path components
+    # Structure: target_path / subject / date_folder / filename
+    # e.g. image03/12m/1.E.1 / 9000099 / 20060713 / 01653203_1x1.jpg
+    #      image03/12m/1.E.1 / 9000099 / 20060713 / 01653203.tar.gz
+    base_depth = len(target_path.rstrip('/').split('/'))
+
+    def parse_alias(alias):
+        parts = alias.split('/')
+        if len(parts) < base_depth + 3:
+            return None
+        return {
+            'subject':     parts[base_depth],
+            'date_folder': parts[base_depth + 1],
+            'level3':      parts[base_depth + 2],
+            'level4':      parts[base_depth + 3] if len(parts) > base_depth + 3 else None,
+        }
+
+    parsed = df_target['download_alias'].apply(parse_alias)
+    df_target = df_target[parsed.notna()].copy()
+    parsed = parsed[parsed.notna()]
+
+    df_target['subject']     = parsed.apply(lambda x: x['subject'])
+    df_target['date_folder'] = parsed.apply(lambda x: x['date_folder'])
+    df_target['level3']      = parsed.apply(lambda x: x['level3'])
+    df_target['level4']      = parsed.apply(lambda x: x['level4'])
+
+    # Step 3: Find all `$number$_1x1.jpg` files sitting directly in the date_folder
+    jpg_mask = (
+        df_target['level4'].isna() &
+        df_target['level3'].str.endswith('_1x1.jpg')
+    )
+    jpg_rows = df_target[jpg_mask].copy()
+
+    if jpg_rows.empty:
+        print("[Step 3] No _1x1.jpg files found under target path. Nothing to download.")
+        return pd.DataFrame()
+
+    jpg_rows['number'] = jpg_rows['level3'].str.replace('_1x1.jpg', '', regex=False)
+    print(f"[Step 3] Found {len(jpg_rows):,} '_1x1.jpg' files across all subjects/date folders.")
+
+    # Step 4: For each jpg, pair it with its corresponding `$number$.tar.gz`
+    alias_set = set(df_target['download_alias'])
+    collected_aliases = []
+    missing_tar_count = 0
+
+    for _, jpg_row in jpg_rows.iterrows():
+        subject     = jpg_row['subject']
+        date_folder = jpg_row['date_folder']
+        number      = jpg_row['number']
+
+        collected_aliases.append(jpg_row['download_alias'])
+
+        tar_gz_alias = f"{target_path}/{subject}/{date_folder}/{number}.tar.gz"
+        if tar_gz_alias in alias_set:
+            collected_aliases.append(tar_gz_alias)
+        else:
+            missing_tar_count += 1
+            print(f"  [Warning] .tar.gz not found in metadata: {tar_gz_alias}")
+
+    collected_aliases = list(set(collected_aliases))  # deduplicate
+    total_candidates = len(collected_aliases)
+
+    print(f"[Step 4] Paired files collected : {total_candidates:,}  "
+          f"(~{len(jpg_rows):,} jpgs + ~{len(jpg_rows) - missing_tar_count:,} tar.gz)  |  "
+          f"Missing tar.gz in metadata: {missing_tar_count}")
+
+    # Step 5: Skip files that already exist locally (if local_root_dir is provided)
+    if local_root_dir is not None:
+        already_exists = []
+        to_download    = []
+
+        for alias in collected_aliases:
+            # Full local path = local_root_dir / download_alias
+            # e.g. /home/download_data/1243742/image03/12m/1.E.1/9000099/20060713/01653203_1x1.jpg
+            local_path = os.path.join(local_root_dir, alias)
+            if os.path.exists(local_path):
+                already_exists.append(alias)
+            else:
+                to_download.append(alias)
+
+        print(f"[Step 5] Local root       : {local_root_dir}")
+        print(f"         Total candidates : {total_candidates:,}")
+        print(f"         Already on disk  : {len(already_exists):,}  (skipped)")
+        print(f"         To be downloaded : {len(to_download):,}")
+
+        collected_aliases = to_download
+    else:
+        print(f"[Step 5] No local_root_dir provided — skipping dedup check.")
+        print(f"         To be downloaded : {total_candidates:,}")
+
+    if not collected_aliases:
+        print("[Done] All files already downloaded. Nothing left to fetch.")
+        return pd.DataFrame()
+
+    # Step 6: Return only the rows still needed for download
+    df_filtered = df[df['download_alias'].isin(collected_aliases)].copy()
+    df_filtered = df_filtered.sort_values(by='download_alias').reset_index(drop=True)
+
+    print(f"[Done] Returning {len(df_filtered):,} rows for download.")
+    return df_filtered
 
 
 class ThreadPool:
@@ -94,18 +230,37 @@ class DownloadRequest:
 
 class Download(Protocol):
 
-    def __init__(self, download_config, args):
+    def __init__(self):
+        # Instance Variables from 'args'
+        # (Pdb) vars(args)
+        # {'package': 1243743, 'paths': [], 'txt': None, 'datastructure': None, 'username': None, 'directory': None, 'workerThreads': None, 'file_regex': None, 'verify': False, 's3_destination': None, 'verbose': False, 'log_dir': None}
+        args = Namespace(
+            package='1243742',
+            paths=[],
+            txt=None,
+            datastructure=None,
+            username=os.getenv("NDA_USER"),
+            directory=["/Users/yuhaohe/Documents/RA/healthcare_AI_RA/ConceptBottleneck/data/OAI/1243742"],
+            workerThreads=4,
+            file_regex=None,
+            verify=False,
+            s3_destination=None,
+            verbose=False,
+            log_dir=None,
+        )
+        # (Pdb) config.__dict__
+        # {'config': <configparser.ConfigParser object at 0x15b1dfcd0>, 'validation_api_endpoint': 'https://nda.nih.gov/api/validation', 'submission_package_api_endpoint': 'https://nda.nih.gov/api/submission-package', 'submission_api_endpoint': 'https://nda.nih.gov/api/submission', 'validationtool_api_endpoint': 'https://nda.nih.gov/api/validationtool/v2', 'package_creation_api_endpoint': 'https://nda.nih.gov/api/packaging-ws', 'package_api_endpoint': 'https://nda.nih.gov/api/package', 'datadictionary_api_endpoint': 'https://nda.nih.gov/api/datadictionary/datastructure', 'collection_api_endpoint': 'https://nda.nih.gov/api/collection', 'user_api_endpoint': 'https://nda.nih.gov/api/user', 'username': 'e0952402', '_args': Namespace(package=1243743, paths=[], txt=None, datastructure=None, username=None, directory=None, workerThreads=None, file_regex=None, verify=False, s3_destination=None, verbose=False, log_dir=None), 'password': 'Hh!@#123', 'validation_api': <NDATools.upload.validation.api.ValidationV2Api object at 0x15b2aa470>, 'submission_package_api': <NDATools.upload.submission.api.SubmissionPackageApi object at 0x15b2aa3e0>, 'submission_api': <NDATools.upload.submission.api.SubmissionApi object at 0x15b2a9b40>, 'collection_api': <NDATools.upload.submission.api.CollectionApi object at 0x15b2a9990>}
+        download_config = NDATools.init_and_create_configuration(args, NDATools.NDA_TOOLS_DOWNLOADCMD_LOGS_FOLDER)
 
-        # Instance variables from config
         self.config = download_config
         self.package_url = self.config.package_api_endpoint
         self.package_creation_url = self.config.package_creation_api_endpoint
         self.datadictionary_url = self.config.datadictionary_api_endpoint
         self.username = download_config.username
         self.password = download_config.password
-        self.auth = requests.auth.HTTPBasicAuth(self.config.username, self.config.password)
+        self.auth = requests.auth.HTTPBasicAuth(self.username, self.password)
+        
 
-        # Instance Variables from 'args'
         if args.directory:
             download_directory = args.directory[0]
         else:
@@ -117,7 +272,7 @@ class Download(Protocol):
         self.inline_s3_links = args.paths
         self.package_id = args.package
         self.data_structure = args.datastructure
-        self.thread_num = download_config.worker_threads
+        self.thread_num = args.workerThreads
         self.regex_file_filter = args.file_regex
         if self.s3_links_file:
             self.download_mode = 'text'
@@ -228,6 +383,7 @@ class Download(Protocol):
             df = self.use_s3_links_file()
         elif self.download_mode == 'package':
             df = self.get_all_files_in_package()
+            df = filter_first_file_per_subject(df, target_path="image03/12m/1.E.1", local_root_dir=self.download_directory)
         else:
             df = self.query_files_by_s3_path(self.inline_s3_links)
 
@@ -276,18 +432,18 @@ class Download(Protocol):
         completed_files = tmp = None  # remove large structures from memory
         skipping_message = ''
 
-        if completed_file_ct > 0:
-            if self.download_directory:
-                skipping_message = 'Skipping {} files which have already been downloaded in {}\n'.format(
-                    completed_file_ct, self.download_directory)
-            else:
-                download_progress_report_path = os.path.join(self.package_metadata_directory,
-                                                             '.download-progress', self.download_job_uuid,
-                                                             'download-progress-report.csv')
-                skipping_message = 'Skipping {} files which have already been downloaded according to log file {}.\n'.format(
-                    completed_file_ct, download_progress_report_path)
-            file_ct_remaining = file_ct_all - completed_file_ct
-            file_sz -= completed_file_sz
+        # if completed_file_ct > 0:
+        #     if self.download_directory:
+        #         skipping_message = 'Skipping {} files which have already been downloaded in {}\n'.format(
+        #             completed_file_ct, self.download_directory)
+        #     else:
+        #         download_progress_report_path = os.path.join(self.package_metadata_directory,
+        #                                                      '.download-progress', self.download_job_uuid,
+        #                                                      'download-progress-report.csv')
+        #         skipping_message = 'Skipping {} files which have already been downloaded according to log file {}.\n'.format(
+        #             completed_file_ct, download_progress_report_path)
+        #     file_ct_remaining = file_ct_all - completed_file_ct
+        #     file_sz -= completed_file_sz
 
         if file_ct_remaining <= 0:
             if self.regex_file_filter:
@@ -686,11 +842,11 @@ class Download(Protocol):
                 writer.writeheader()
 
         if not os.path.exists(self.package_metadata_directory):
-            os.mkdir(self.package_metadata_directory)
+            os.makedirs(self.package_metadata_directory, exist_ok=True)
 
         DOWNLOAD_PROGRESS_FOLDER = os.path.join(self.package_metadata_directory, '.download-progress')
         if not os.path.exists(DOWNLOAD_PROGRESS_FOLDER):
-            os.mkdir(DOWNLOAD_PROGRESS_FOLDER)
+            os.makedirs(DOWNLOAD_PROGRESS_FOLDER, exist_ok=True)
 
         download_job_manifest_path = os.path.join(DOWNLOAD_PROGRESS_FOLDER, 'download-job-manifest.csv')
         if not os.path.exists(download_job_manifest_path):
@@ -705,7 +861,7 @@ class Download(Protocol):
 
         DOWNLOAD_JOB_UUID_DIR = os.path.join(DOWNLOAD_PROGRESS_FOLDER, str(self.download_job_uuid))
         if not os.path.exists(DOWNLOAD_JOB_UUID_DIR):
-            os.mkdir(DOWNLOAD_JOB_UUID_DIR)
+            os.makedirs(DOWNLOAD_JOB_UUID_DIR, exist_ok=True)
 
         download_progress_report_file = os.path.join(DOWNLOAD_JOB_UUID_DIR, 'download-progress-report.csv')
         if not os.path.exists(download_progress_report_file):

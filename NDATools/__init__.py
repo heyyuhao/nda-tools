@@ -57,12 +57,12 @@ def check_version():
                 version = max(version, ver)
     pypi_version = str(version)
 
-    if parse(__version__) < parse(pypi_version):
-        print(
-            "Your version of nda-tools is out of date. Please upgrade to the latest version ({}) from PyPi or GitHub and "
-            "try again. \n\tTo upgrade using pip, run: \r\npip install nda-tools=={}".format(pypi_version,
-                                                                                             pypi_version))
-        sys.exit(1)
+    # if parse(__version__) < parse(pypi_version):
+    #     print(
+    #         "Your version of nda-tools is out of date. Please upgrade to the latest version ({}) from PyPi or GitHub and "
+    #         "try again. \n\tTo upgrade using pip, run: \r\npip install nda-tools=={}".format(pypi_version,
+    #                                                                                          pypi_version))
+    #     sys.exit(1)
 
 
 NDA_ORGINIZATION_ROOT_FOLDER = os.path.join(os.path.expanduser('~'), 'NDA')
