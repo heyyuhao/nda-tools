@@ -1,9 +1,15 @@
 import argparse
+import os
 import sys
 from pathlib import Path
-NDA_ROOT = Path(
-    "/Users/yuhaohe/Documents/RA/healthcare_AI_RA/ConceptBottleneck/submodule/nda-tools"
-)
+from dotenv import load_dotenv
+
+for _p in [Path(__file__).resolve(), *Path(__file__).resolve().parents]:
+    if (_p / ".env").exists():
+        load_dotenv(_p / ".env")
+        break
+
+NDA_ROOT = Path(os.getenv("NDA_TOOLS_ROOT", str(Path(__file__).resolve().parents[2])))
 if str(NDA_ROOT) not in sys.path:
     sys.path.insert(0, str(NDA_ROOT))
 

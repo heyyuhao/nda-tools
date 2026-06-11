@@ -26,7 +26,10 @@ from NDATools.AltEndpointSSLAdapter import AltEndpointSSLAdapter
 from NDATools.Utils import *
 
 from dotenv import load_dotenv
-load_dotenv()
+for _p in [Path(__file__).resolve(), *Path(__file__).resolve().parents]:
+    if (_p / ".env").exists():
+        load_dotenv(_p / ".env")
+        break
 
 logger = logging.getLogger(__name__)
 
@@ -234,13 +237,16 @@ class Download(Protocol):
         # Instance Variables from 'args'
         # (Pdb) vars(args)
         # {'package': 1243743, 'paths': [], 'txt': None, 'datastructure': None, 'username': None, 'directory': None, 'workerThreads': None, 'file_regex': None, 'verify': False, 's3_destination': None, 'verbose': False, 'log_dir': None}
+        _PACKAGE_ID = os.getenv("NDA_PACKAGE_ID")
+        _download_dir = os.getenv("NDA_DOWNLOAD_DIR")
+
         args = Namespace(
-            package='1243742',
+            package=_PACKAGE_ID,
             paths=[],
             txt=None,
             datastructure=None,
             username=os.getenv("NDA_USER"),
-            directory=["/Users/yuhaohe/Documents/RA/healthcare_AI_RA/ConceptBottleneck/data/OAI/1243742"],
+            directory=[_download_dir] if _download_dir else None,
             workerThreads=4,
             file_regex=None,
             verify=False,
@@ -258,7 +264,7 @@ class Download(Protocol):
         self.datadictionary_url = self.config.datadictionary_api_endpoint
         self.username = download_config.username
         self.password = download_config.password
-        self.auth = requests.auth.HTTPBasicAuth(self.username, self.password)
+        self.auth = self.config.get_auth()
         
 
         if args.directory:

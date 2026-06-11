@@ -288,6 +288,35 @@ class CollectionApi:
         return sorted([NdaCollection(**c) for c in collections], key=lambda x: x.id)
 
 
+class RasAuthApi:
+    def __init__(self, ras_login_api_endpoint):
+        self.ras_login_api_endpoint = ras_login_api_endpoint
+
+    def login(self, username, password):
+        auth = requests.auth.HTTPBasicAuth(username, password)
+        try:
+            response = post_request(self.ras_login_api_endpoint,
+                                    auth=auth,
+                                    deserialize_handler=DeserializeHandler.none,
+                                    error_handler=HttpErrorHandlingStrategy.reraise_status)
+            return response.text
+        except HTTPError as e:
+            if e.response.status_code == 423:
+                msg = '''
+Your account is locked, which is preventing your authorized access to nda-tools. To unlock your account, set a new password by doing the following:
+1. Log into NDA (https://nda.nih.gov) using your RAS credentials (eRA Commons, Login.gov, or Smart Card/CAC)')
+2. Navigate to your NDA profile (https://nda.nih.gov/user/dashboard/profile)')
+3. Click on the 'Update Password' button, found near the upper right corner of the page')
+4. Set a new password. Once your password is successfully reset, your account will be unlocked.'''
+                exit_error(message=msg)
+            elif e.response.status_code == 401:
+                return None
+            else:
+                msg = f'\nSystem Error while checking credentials for user {username}'
+                msg += '\nPlease contact NDAHelp@mail.nih.gov for help in resolving this error'
+                exit_error(message=msg)
+
+
 class UserApi:
     def __init__(self, user_api_endpoint):
         self.user_api_endpoint = user_api_endpoint

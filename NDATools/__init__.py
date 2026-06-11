@@ -7,6 +7,13 @@ import os
 import pathlib
 import shutil
 import sys
+from pathlib import Path as _Path
+from dotenv import load_dotenv as _load_dotenv
+
+for _p in [_Path(__file__).resolve(), *_Path(__file__).resolve().parents]:
+    if (_p / ".env").exists():
+        _load_dotenv(_p / ".env")
+        break
 
 __version__ = '0.5.0'
 
@@ -122,6 +129,10 @@ def prerun_checks_and_setup():
 
 def _get_password(username) -> str:
     global _get_keyring
+    env_password = os.getenv("NDA_PASSWORD")
+    if env_password:
+        logger.debug('retrieved password from NDA_PASSWORD env var')
+        return env_password
     try:
         if _get_keyring:
             password = keyring.get_password(SERVICE_NAME, username)
@@ -152,9 +163,9 @@ def get_username():
     return str(input('Enter your NDA account username:')).lower().strip()
 
 
-def _get_user_credentials(config) -> Tuple[str, str]:
+def _get_user_credentials(config) -> Tuple[str, str, str]:
     # Adding NDATools dependencies to the start of __init__ can cause errors during installation, so keep import here.
-    from NDATools.upload.submission.api import UserApi
+    from NDATools.upload.submission.api import RasAuthApi
     # username is fetched from settings.cfg, and it is not present at the first time use of nda-tools
     # display NDA account instructions
     global _get_keyring
@@ -175,15 +186,17 @@ def _get_user_credentials(config) -> Tuple[str, str]:
     while not password:
         password = _get_password(username)
 
-    # validate credentials
-    api = UserApi(config.user_api_endpoint)
-    while not api.is_valid_nda_credentials(username, password):
+    # validate credentials and obtain Bearer token
+    api = RasAuthApi(config.ras_login_api_endpoint)
+    token = api.login(username, password)
+    while not token:
         logger.info('Username/password combination is incorrect')
         _get_keyring = False
         username = get_username()
         password = _get_password(username)
+        token = api.login(username, password)
     _try_save_password_keyring(username, password)
-    return username, password
+    return username, password, token
 
 
 def init_and_create_configuration(args, logs_folder, auth_req=True):
@@ -197,8 +210,8 @@ def init_and_create_configuration(args, logs_folder, auth_req=True):
 
 
 def authenticate(config):
-    username, password = _get_user_credentials(config)
-    config.update_with_auth(username, password)
+    username, password, token = _get_user_credentials(config)
+    config.update_with_auth(username, password, token)
     return config
 
 

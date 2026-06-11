@@ -7,6 +7,7 @@ import time
 
 import yaml
 from pkg_resources import resource_filename
+from requests.auth import AuthBase
 
 import NDATools
 from NDATools import NDA_TOOLS_LOGGING_YML_FILE
@@ -18,6 +19,15 @@ from NDATools.upload.validation.manifests import ManifestFileUploader
 from NDATools.upload.validation.results_writer import ResultsWriterFactory
 
 logger = logging.getLogger(__name__)
+
+
+class DynamicBearerAuth(AuthBase):
+    def __init__(self, config):
+        self._config = config
+
+    def __call__(self, request):
+        request.headers['Authorization'] = f'Bearer {self._config.token}'
+        return request
 
 
 class LoggingConfiguration:
@@ -57,6 +67,8 @@ class ClientConfiguration:
         self.datadictionary_api_endpoint = self.config.get("Endpoints", "datadictionary")
         self.collection_api_endpoint = self.config.get("Endpoints", "collection")
         self.user_api_endpoint = self.config.get("Endpoints", "user")
+        ras_api_endpoint = self.config.get("Endpoints", "ras")
+        self.ras_login_api_endpoint = f"{ras_api_endpoint}/user/login"
         self.username = self.config.get("User", "username").lower()
         # TODO remove args from config
         self._args = args
@@ -68,6 +80,8 @@ class ClientConfiguration:
             logger.warning("-u/--username argument not provided. Using default value of '%s' which was saved in %s",
                            self.username, NDATools.NDA_TOOLS_SETTINGS_CFG_FILE)
         self.password = None
+        self.token = None
+        self._auth = DynamicBearerAuth(self)
 
         if self._is_vtcmd():
             self.v2_enabled = False
@@ -155,12 +169,16 @@ class ClientConfiguration:
         else:
             logger.debug(f'settings.cfg is up to date')
 
-    def is_authenticated(self):
-        return self.username and self.password
+    def get_auth(self):
+        return self._auth
 
-    def update_with_auth(self, username, password):
+    def is_authenticated(self):
+        return self.username and self.token
+
+    def update_with_auth(self, username, password, token):
         self.username = username
         self.password = password
+        self.token = token
         self._save_username()
         self._save_apis()
 
