@@ -1,6 +1,7 @@
 import copy
 import csv
 import gzip
+import json
 import os.path
 import pathlib
 import platform
@@ -33,25 +34,40 @@ for _p in [Path(__file__).resolve(), *Path(__file__).resolve().parents]:
 
 logger = logging.getLogger(__name__)
 
-def filter_first_file_per_subject(df, target_path, local_root_dir=None):
+def filter_first_file_per_subject(df, target_path, local_root_dir=None, label_lookup=None):
     """
-    Filters the metadata DataFrame to include only files under `target_path` matching:
-      - For each subject folder (numeric, e.g. 9000099) under target_path
-      - For each date folder under that subject
-      - If any `$number$_1x1.jpg` exists in that date folder:
-          collect that jpg AND the corresponding `$number$.tar.gz` file
-      - If no `_1x1.jpg` exists in a date folder, skip it entirely
-      - If local_root_dir is provided, skip files that already exist locally
+    Filters the NDA package metadata DataFrame to select only the files needed for
+    labeled knee X-ray subjects, following this pipeline:
+
+      Step 1  — Keep only rows whose download_alias starts with target_path.
+      Step 2  — Parse each alias into (subject, date_folder, level3, level4) columns.
+                Path structure: target_path / subject / date_folder / filename
+                e.g. image03/12m/1.E.1 / 9000099 / 20060713 / 01653203_1x1.jpg
+      Step 3  — Identify all thumbnail files matching `$number$_1x1.jpg` that sit
+                directly inside a date_folder (level4 is None).
+      Step 3.5— If label_lookup is provided, drop any (subject, date_folder) pair
+                whose key `{subject}_{date_folder}` is not in the lookup set.
+                The lookup is pre-built from oai_kxrsemiquant01.txt (dropna rows),
+                stored in valid_subject_dates.json. This reduces downloads
+                from ~1,767 files to the ~657 subjects that actually have labels.
+      Step 4  — For each surviving jpg, collect its alias and pair it with the
+                corresponding `$number$.tar.gz` alias if present in the metadata.
+      Step 5  — If local_root_dir is given, skip (jpg + tar.gz) pairs whose files
+                already exist on disk.
+      Step 6  — Return the filtered DataFrame of rows still needed for download.
 
     Args:
-        df (pd.DataFrame): metadata with 'download_alias' column
-        target_path (str): e.g., "image03/12m/1.E.1"
-        local_root_dir (str, optional): local root directory where files are saved,
-                                        e.g. "/home/download_data/1243742"
-                                        Full local path = local_root_dir / download_alias
+        df (pd.DataFrame): full package metadata with a 'download_alias' column.
+        target_path (str): prefix to filter on, e.g. "image03/12m/1.E.1".
+        local_root_dir (str, optional): local root where files are saved; used to
+            skip already-downloaded files. Full path = local_root_dir / download_alias.
+        label_lookup (set, optional): set of "{src_subject_id}_{YYYYMMDD}" strings
+            derived from oai_kxrsemiquant01.txt. Only (subject, date) pairs present
+            in this set are downloaded. If None, no label filtering is applied.
 
     Returns:
-        pd.DataFrame: filtered DataFrame (excluding already-downloaded files)
+        pd.DataFrame: rows from df that still need to be downloaded, sorted by
+            download_alias. Empty DataFrame if nothing remains.
     """
     import os
     import pandas as pd
@@ -102,6 +118,17 @@ def filter_first_file_per_subject(df, target_path, local_root_dir=None):
 
     jpg_rows['number'] = jpg_rows['level3'].str.replace('_1x1.jpg', '', regex=False)
     print(f"[Step 3] Found {len(jpg_rows):,} '_1x1.jpg' files across all subjects/date folders.")
+
+    # Step 3.5: Filter to only (subject, date) pairs that have a label entry
+    if label_lookup is not None:
+        before = len(jpg_rows)
+        jpg_rows = jpg_rows[
+            (jpg_rows['subject'] + "_" + jpg_rows['date_folder']).isin(label_lookup)
+        ]
+        print(f"[Step 3.5] Label filter applied  : {before:,} → {len(jpg_rows):,} jpg files retained")
+        if jpg_rows.empty:
+            print("[Step 3.5] No files match the label lookup. Nothing to download.")
+            return pd.DataFrame()
 
     # Step 4: For each jpg, pair it with its corresponding `$number$.tar.gz`
     alias_set = set(df_target['download_alias'])
@@ -239,6 +266,16 @@ class Download(Protocol):
         # {'package': 1243743, 'paths': [], 'txt': None, 'datastructure': None, 'username': None, 'directory': None, 'workerThreads': None, 'file_regex': None, 'verify': False, 's3_destination': None, 'verbose': False, 'log_dir': None}
         _PACKAGE_ID = os.getenv("NDA_PACKAGE_ID")
         _download_dir = os.getenv("NDA_DOWNLOAD_DIR")
+
+        _repo_dir = os.getenv("REPO_DIR")
+        _lookup_path = os.path.join(_repo_dir, "data", "OAI", "scripts", "1_valid_subject_dates.json") if _repo_dir else None
+        self.label_lookup = None
+        if _lookup_path and os.path.exists(_lookup_path):
+            with open(_lookup_path) as _f:
+                self.label_lookup = set(json.load(_f))
+            logger.info(f"Label lookup loaded: {len(self.label_lookup):,} valid (subject, date) keys from {_lookup_path}")
+        else:
+            logger.warning("Label lookup file not found — all files will be downloaded without label filtering")
 
         args = Namespace(
             package=_PACKAGE_ID,
@@ -389,7 +426,7 @@ class Download(Protocol):
             df = self.use_s3_links_file()
         elif self.download_mode == 'package':
             df = self.get_all_files_in_package()
-            df = filter_first_file_per_subject(df, target_path="image03/12m/1.E.1", local_root_dir=self.download_directory)
+            df = filter_first_file_per_subject(df, target_path="image03/12m/1.E.1", local_root_dir=self.download_directory, label_lookup=self.label_lookup)
         else:
             df = self.query_files_by_s3_path(self.inline_s3_links)
 
