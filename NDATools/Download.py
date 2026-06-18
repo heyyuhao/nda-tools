@@ -34,36 +34,36 @@ for _p in [Path(__file__).resolve(), *Path(__file__).resolve().parents]:
 
 logger = logging.getLogger(__name__)
 
-def filter_first_file_per_subject(df, target_path, local_root_dir=None, label_lookup=None):
+def filter_first_file_per_subject(df, local_root_dir=None, label_lookup=None):
     """
-    Filters the NDA package metadata DataFrame to select only the files needed for
-    labeled knee X-ray subjects, following this pipeline:
+    Filters the NDA package metadata DataFrame to select only the tar.gz files needed
+    for labeled knee X-ray subjects. No path prefix is required — the function scans
+    all rows and parses each alias from the END, so it works with any NDA package
+    folder structure automatically.
 
-      Step 1  — Keep only rows whose download_alias starts with target_path.
-      Step 2  — Parse each alias into (subject, date_folder, level3, level4) columns.
-                Path structure: target_path / subject / date_folder / filename
-                e.g. image03/12m/1.E.1 / 9000099 / 20060713 / 01653203_1x1.jpg
-      Step 3  — Identify all thumbnail files matching `$number$_1x1.jpg` that sit
-                directly inside a date_folder (level4 is None).
-      Step 3.5— If label_lookup is provided, drop any (subject, date_folder) pair
-                whose key `{subject}_{date_folder}` is not in the lookup set.
-                The lookup is pre-built from oai_kxrsemiquant01.txt (dropna rows),
-                stored in valid_subject_dates.json. This reduces downloads
-                from ~1,767 files to the ~657 subjects that actually have labels.
-      Step 4  — For each surviving jpg, collect its alias and pair it with the
-                corresponding `$number$.tar.gz` alias if present in the metadata.
-      Step 5  — If local_root_dir is given, skip (jpg + tar.gz) pairs whose files
-                already exist on disk.
-      Step 6  — Return the filtered DataFrame of rows still needed for download.
+      Step 1  — Find all rows whose download_alias ends with '.tar.gz' and has at
+                least 3 path components at the tail: subject / date / series.tar.gz.
+                Parsed from the end: parts[-3]=subject, parts[-2]=date, parts[-1]=filename.
+      Step 2  — If label_lookup is provided, keep only tar.gz rows whose series number
+                is endorsed by a barcode: any(bc.endswith(series) for bc in lookup[key]).
+                The lookup is a dict "{subject}_{date}" → [barcode, ...] pre-built from
+                oai_kxrsemiquant01.txt. The barcode match is the sole discriminator —
+                no prefix assumption is needed.
+      Step 3  — For each surviving tar.gz, skip if already handled locally:
+                  a) tar.gz file already on disk (downloaded, not yet extracted), OR
+                  b) extracted folder exists and is non-empty (already extracted;
+                     tar.gz may have been deleted by the post-extraction cleanup step).
+                Reports counts for each skip reason.
+      Step 4  — Return the filtered DataFrame of rows still needed for download.
 
     Args:
         df (pd.DataFrame): full package metadata with a 'download_alias' column.
-        target_path (str): prefix to filter on, e.g. "image03/12m/1.E.1".
         local_root_dir (str, optional): local root where files are saved; used to
-            skip already-downloaded files. Full path = local_root_dir / download_alias.
-        label_lookup (set, optional): set of "{src_subject_id}_{YYYYMMDD}" strings
-            derived from oai_kxrsemiquant01.txt. Only (subject, date) pairs present
-            in this set are downloaded. If None, no label filtering is applied.
+            skip already-handled files. Full path = local_root_dir / download_alias.
+        label_lookup (dict, optional): dict mapping "{src_subject_id}_{YYYYMMDD}" →
+            list of barcode strings, derived from oai_kxrsemiquant01.txt. Only
+            tar.gz files whose series number matches a barcode are downloaded.
+            If None, all tar.gz files in the package are downloaded.
 
     Returns:
         pd.DataFrame: rows from df that still need to be downloaded, sorted by
@@ -72,120 +72,94 @@ def filter_first_file_per_subject(df, target_path, local_root_dir=None, label_lo
     import os
     import pandas as pd
 
-    # Step 1: Keep only files under target_path
-    df_target = df[df['download_alias'].str.startswith(target_path)].copy()
-    if df_target.empty:
-        print(f"[Step 1] No files found under '{target_path}' in metadata.")
-        return df_target
-    print(f"[Step 1] Found {len(df_target):,} metadata rows under '{target_path}'.")
+    print(f"[Step 1] Total metadata rows in package : {len(df):,}")
 
-    # Step 2: Parse path components
-    # Structure: target_path / subject / date_folder / filename
-    # e.g. image03/12m/1.E.1 / 9000099 / 20060713 / 01653203_1x1.jpg
-    #      image03/12m/1.E.1 / 9000099 / 20060713 / 01653203.tar.gz
-    base_depth = len(target_path.rstrip('/').split('/'))
-
-    def parse_alias(alias):
+    # Step 1: Find all .tar.gz rows and parse subject/date/series from the path end.
+    # Structure (from end): .../ subject / date / series.tar.gz
+    # This works regardless of how many prefix levels the package uses.
+    def parse_from_end(alias):
+        if not alias.endswith('.tar.gz'):
+            return None
         parts = alias.split('/')
-        if len(parts) < base_depth + 3:
+        if len(parts) < 3:
             return None
         return {
-            'subject':     parts[base_depth],
-            'date_folder': parts[base_depth + 1],
-            'level3':      parts[base_depth + 2],
-            'level4':      parts[base_depth + 3] if len(parts) > base_depth + 3 else None,
+            'subject':     parts[-3],
+            'date_folder': parts[-2],
+            'series':      parts[-1][:-7],  # strip ".tar.gz"
         }
 
-    parsed = df_target['download_alias'].apply(parse_alias)
-    df_target = df_target[parsed.notna()].copy()
-    parsed = parsed[parsed.notna()]
+    parsed = df['download_alias'].apply(parse_from_end)
+    tar_df  = df[parsed.notna()].copy()
+    parsed  = parsed[parsed.notna()]
 
-    df_target['subject']     = parsed.apply(lambda x: x['subject'])
-    df_target['date_folder'] = parsed.apply(lambda x: x['date_folder'])
-    df_target['level3']      = parsed.apply(lambda x: x['level3'])
-    df_target['level4']      = parsed.apply(lambda x: x['level4'])
+    tar_df['subject']     = parsed.apply(lambda x: x['subject'])
+    tar_df['date_folder'] = parsed.apply(lambda x: x['date_folder'])
+    tar_df['series']      = parsed.apply(lambda x: x['series'])
 
-    # Step 3: Find all `$number$_1x1.jpg` files sitting directly in the date_folder
-    jpg_mask = (
-        df_target['level4'].isna() &
-        df_target['level3'].str.endswith('_1x1.jpg')
-    )
-    jpg_rows = df_target[jpg_mask].copy()
+    print(f"[Step 1] .tar.gz files found            : {len(tar_df):,}")
 
-    if jpg_rows.empty:
-        print("[Step 3] No _1x1.jpg files found under target path. Nothing to download.")
+    if tar_df.empty:
+        print("[Step 1] No .tar.gz files found in package metadata.")
         return pd.DataFrame()
 
-    jpg_rows['number'] = jpg_rows['level3'].str.replace('_1x1.jpg', '', regex=False)
-    print(f"[Step 3] Found {len(jpg_rows):,} '_1x1.jpg' files across all subjects/date folders.")
-
-    # Step 3.5: Filter to only (subject, date) pairs that have a label entry
+    # Step 2: Apply label filter using barcode.endswith(series).
     if label_lookup is not None:
-        before = len(jpg_rows)
-        jpg_rows = jpg_rows[
-            (jpg_rows['subject'] + "_" + jpg_rows['date_folder']).isin(label_lookup)
-        ]
-        print(f"[Step 3.5] Label filter applied  : {before:,} → {len(jpg_rows):,} jpg files retained")
-        if jpg_rows.empty:
-            print("[Step 3.5] No files match the label lookup. Nothing to download.")
+        before = len(tar_df)
+
+        def series_has_label(row):
+            key = row['subject'] + "_" + row['date_folder']
+            barcodes = label_lookup.get(key, [])
+            return any(bc.endswith(row['series']) for bc in barcodes)
+
+        tar_df = tar_df[tar_df.apply(series_has_label, axis=1)]
+        print(f"[Step 2] Label filter applied           : {before:,} → {len(tar_df):,} tar.gz retained")
+
+        if tar_df.empty:
+            print("[Step 2] No files match the label lookup. Nothing to download.")
             return pd.DataFrame()
+    else:
+        print(f"[Step 2] No label_lookup — all {len(tar_df):,} tar.gz files are candidates.")
 
-    # Step 4: For each jpg, pair it with its corresponding `$number$.tar.gz`
-    alias_set = set(df_target['download_alias'])
-    collected_aliases = []
-    missing_tar_count = 0
-
-    for _, jpg_row in jpg_rows.iterrows():
-        subject     = jpg_row['subject']
-        date_folder = jpg_row['date_folder']
-        number      = jpg_row['number']
-
-        collected_aliases.append(jpg_row['download_alias'])
-
-        tar_gz_alias = f"{target_path}/{subject}/{date_folder}/{number}.tar.gz"
-        if tar_gz_alias in alias_set:
-            collected_aliases.append(tar_gz_alias)
-        else:
-            missing_tar_count += 1
-            print(f"  [Warning] .tar.gz not found in metadata: {tar_gz_alias}")
-
-    collected_aliases = list(set(collected_aliases))  # deduplicate
-    total_candidates = len(collected_aliases)
-
-    print(f"[Step 4] Paired files collected : {total_candidates:,}  "
-          f"(~{len(jpg_rows):,} jpgs + ~{len(jpg_rows) - missing_tar_count:,} tar.gz)  |  "
-          f"Missing tar.gz in metadata: {missing_tar_count}")
-
-    # Step 5: Skip files that already exist locally (if local_root_dir is provided)
+    # Step 3: Skip files already handled locally.
+    # a) tar.gz on disk → downloaded but not yet extracted
+    # b) extracted folder exists and non-empty → already extracted (tar.gz may be deleted)
     if local_root_dir is not None:
-        already_exists = []
-        to_download    = []
+        skip_tar_exists = []
+        skip_extracted  = []
+        to_download     = []
 
-        for alias in collected_aliases:
-            # Full local path = local_root_dir / download_alias
-            # e.g. /home/download_data/1243742/image03/12m/1.E.1/9000099/20060713/01653203_1x1.jpg
-            local_path = os.path.join(local_root_dir, alias)
-            if os.path.exists(local_path):
-                already_exists.append(alias)
+        for _, row in tar_df.iterrows():
+            alias       = row['download_alias']
+            tar_path    = os.path.join(local_root_dir, alias)
+            # Extracted folder sits next to the tar.gz, named after the series number
+            extract_dir = os.path.join(os.path.dirname(tar_path), row['series'])
+
+            if os.path.isfile(tar_path):
+                skip_tar_exists.append(alias)
+            elif os.path.isdir(extract_dir) and os.listdir(extract_dir):
+                skip_extracted.append(alias)
             else:
                 to_download.append(alias)
 
-        print(f"[Step 5] Local root       : {local_root_dir}")
-        print(f"         Total candidates : {total_candidates:,}")
-        print(f"         Already on disk  : {len(already_exists):,}  (skipped)")
-        print(f"         To be downloaded : {len(to_download):,}")
+        print(f"[Step 3] Local root                     : {local_root_dir}")
+        print(f"         Total label-matched             : {len(tar_df):,}")
+        print(f"         tar.gz on disk (pending)        : {len(skip_tar_exists):,}  (skipped)")
+        print(f"         Already extracted               : {len(skip_extracted):,}  (skipped)")
+        print(f"         To be downloaded                : {len(to_download):,}")
 
-        collected_aliases = to_download
+        aliases_to_fetch = to_download
     else:
-        print(f"[Step 5] No local_root_dir provided — skipping dedup check.")
-        print(f"         To be downloaded : {total_candidates:,}")
+        print(f"[Step 3] No local_root_dir — skipping dedup check.")
+        print(f"         To be downloaded : {len(tar_df):,}")
+        aliases_to_fetch = list(tar_df['download_alias'])
 
-    if not collected_aliases:
-        print("[Done] All files already downloaded. Nothing left to fetch.")
+    if not aliases_to_fetch:
+        print("[Done] All files already handled. Nothing left to fetch.")
         return pd.DataFrame()
 
-    # Step 6: Return only the rows still needed for download
-    df_filtered = df[df['download_alias'].isin(collected_aliases)].copy()
+    # Step 4: Return only the rows still needed for download
+    df_filtered = df[df['download_alias'].isin(aliases_to_fetch)].copy()
     df_filtered = df_filtered.sort_values(by='download_alias').reset_index(drop=True)
 
     print(f"[Done] Returning {len(df_filtered):,} rows for download.")
@@ -272,8 +246,8 @@ class Download(Protocol):
         self.label_lookup = None
         if _lookup_path and os.path.exists(_lookup_path):
             with open(_lookup_path) as _f:
-                self.label_lookup = set(json.load(_f))
-            logger.info(f"Label lookup loaded: {len(self.label_lookup):,} valid (subject, date) keys from {_lookup_path}")
+                self.label_lookup = json.load(_f)  # dict: "{subject}_{date}" → [barcode, ...]
+            logger.info(f"Label lookup loaded: {len(self.label_lookup):,} valid (subject, date) entries from {_lookup_path}")
         else:
             logger.warning("Label lookup file not found — all files will be downloaded without label filtering")
 
@@ -426,7 +400,7 @@ class Download(Protocol):
             df = self.use_s3_links_file()
         elif self.download_mode == 'package':
             df = self.get_all_files_in_package()
-            df = filter_first_file_per_subject(df, target_path="image03/12m/1.E.1", local_root_dir=self.download_directory, label_lookup=self.label_lookup)
+            df = filter_first_file_per_subject(df, local_root_dir=self.download_directory, label_lookup=self.label_lookup)
         else:
             df = self.query_files_by_s3_path(self.inline_s3_links)
 
